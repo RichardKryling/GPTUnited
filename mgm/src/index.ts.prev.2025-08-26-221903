@@ -1,0 +1,383 @@
+import 'dotenv/config';
+import { randomUUID } from 'node:crypto';
+import express from 'express';
+import cors from 'cors';
+import { Pool } from 'pg';
+import { QdrantClient } from '@qdrant/js-client-rest';
+import OpenAI from 'openai';
+import { randomUUID } from 'crypto';
+
+/** ---------- ENV ---------- */
+const PORT = Number(process.env.PORT ?? 8090);
+const DATABASE_URL = process.env.DATABASE_URL ?? 'postgresql://gptu:gptu@127.0.0.1:5432/gptu';
+
+const QDRANT_URL = process.env.QDRANT_URL ?? 'http://127.0.0.1:6333';
+const QDRANT_COLLECTION = process.env.QDRANT_COLLECTION ?? 'teachings';
+
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY ?? '';
+const OPENAI_EMBED_MODEL = process.env.OPENAI_EMBED_MODEL ?? 'text-embedding-3-small';
+const EMBED_DIM = 1536; // text-embedding-3-small
+
+const RETRIEVAL_THRESHOLD = Number(process.env.RETRIEVAL_THRESHOLD ?? 0.62);
+const TOP_K = Number(process.env.TOP_K ?? 5);
+
+/** ---------- APP ---------- */
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '2mb' }));
+
+/** ---------- Clients ---------- */
+const pool = new Pool({ connectionString: DATABASE_URL });
+const qdrant = new QdrantClient({ url: QDRANT_URL });
+const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
+
+/** ---------- DB init ---------- */
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS teachings (
+      id TEXT PRIMARY KEY,
+      text TEXT NOT NULL,
+      tags TEXT[] DEFAULT '{}',
+      scope TEXT NOT NULL CHECK (scope IN ('global','session')),
+      session_id TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS teachings_scope_created_idx ON teachings(scope, created_at DESC);`);
+}
+initDb().catch(err => { console.error('DB init failed', err); process.exit(1); });
+
+/** ---------- Qdrant init ---------- */
+async function ensureCollection() {
+  try {
+    await qdrant.getCollection(QDRANT_COLLECTION);
+  } catch {
+    // create if missing
+    await qdrant.createCollection(QDRANT_COLLECTION, {
+      vectors: { size: EMBED_DIM, distance: 'Cosine' },
+    });
+  }
+}
+ensureCollection().catch(e => console.warn('Qdrant init warn:', (e as Error).message));
+
+/** ---------- Helpers ---------- */
+async function embedOne(text: string): Promise<number[]> {
+  if (!openai) throw new Error('OpenAI not configured');
+  const e = await openai.embeddings.create({ model: OPENAI_EMBED_MODEL, input: text });
+  return e.data[0].embedding as unknown as number[];
+}
+
+async function upsertPoint(id: string, vector: number[], payload: any) {
+  await qdrant.upsert(QDRANT_COLLECTION, { points: [{ id, vector, payload }] });
+}
+
+function sidFrom(req: any): string | null {
+  return (req.header('x-session-id') as string) || null;
+}
+
+/** ---------- Routes ---------- */
+
+app.get('/health', async (_req, res) => {
+  let db = 'down', qdr = 'down';
+  try { await pool.query('SELECT 1'); db = 'up'; } catch {}
+  try { await qdrant.getCollections(); qdr = 'up'; } catch {}
+  res.json({ ok: true, db, qdrant: qdr, usesOpenAI: Boolean(openai) });
+});
+
+/** Teach: persist + embed + upsert */
+app.post('/teach', async (req, res) => {
+  try {
+    const { text, tags = [], scope = 'session' } = req.body ?? {};
+    const sessionId = sidFrom(req);
+
+    if (!text || typeof text !== 'string') return res.status(400).json({ ok: false, error: 'text required' });
+    if (!['global','session'].includes(scope)) return res.status(400).json({ ok: false, error: 'bad scope' });
+
+    const id = randomUUID();
+    await pool.query(
+      `INSERT INTO teachings (id, text, tags, scope, session_id) VALUES ($1,$2,$3,$4,$5)`,
+      [id, text, Array.isArray(tags) ? tags : [], scope, scope === 'session' ? sessionId : null]
+    );
+
+    try {
+      const vec = await embedOne(text);
+      await upsertPoint(id, vec, { id, text, tags, scope, session_id: scope === 'session' ? sessionId : null });
+    } catch (e) {
+      console.warn('embed/upsert warn:', (e as Error).message);
+    }
+
+    res.json({ ok: true, id });
+  } catch (e) {
+    console.error('teach error', e);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
+/** Respond: DB-first (Qdrant) → if weak, OpenAI fallback; save AI reply */
+
+  try {
+    // 1) Embed query and search vectors
+    let sources: { id: string, text: string, tags: string[], score: number }[] = [];
+    let maxScore = 0;
+
+    try {
+      const qv = await embedOne(input);
+      const hits = await qdrant.search(QDRANT_COLLECTION, { vector: qv, limit: TOP_K, with_payload: true });
+      sources = hits.map((h: any) => ({
+        id: String(h.payload?.id ?? h.id),
+        text: String(h.payload?.text ?? ''),
+        tags: (h.payload?.tags as string[]) ?? [],
+        score: Number(h.score ?? 0),
+      })).filter(s => s.text);
+      maxScore = sources.reduce((m, s) => Math.max(m, s.score), 0);
+    } catch (e) {
+      console.warn('vector search warn:', (e as Error).message);
+      // soft fallback: recent rows
+      const { rows } = await pool.query(
+        `SELECT id, text, tags FROM teachings ORDER BY created_at DESC LIMIT $1`, [TOP_K]
+      );
+      sources = rows.map(r => ({ id: r.id, text: r.text, tags: r.tags ?? [], score: 0.4 }));
+      maxScore = sources.length ? sources[0].score : 0;
+    }
+
+    // 2) If confident enough → concise retrieval reply
+    if (maxScore >= RETRIEVAL_THRESHOLD && sources[0]) {
+      const reply = `Based on prior knowledge: ${sources[0].text}`;
+      return res.json({ reply, sources });
+    }
+
+    // 3) Otherwise → OpenAI answer with retrieved context, then SAVE it
+    if (!openai) {
+      return res.json({ reply: 'No confident answer (no OpenAI configured)', sources });
+    }
+
+    const context = sources.map((s, i) => `(${i+1}) ${s.text}`).join('\n');
+    const messages = [
+      { role: 'system' as const, content: 'You are a concise assistant. Use context if relevant; otherwise answer briefly.' },
+      { role: 'user' as const, content: `Context:\n${context || '(none)'}\n\nQuestion: ${input}\n\nAnswer:` }
+    ];
+
+    const chat = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages,
+      temperature: 0.2,
+    });
+
+    const reply = chat.choices?.[0]?.message?.content?.trim() || 'No reply.';
+
+    // SAVE the AI reply into teachings (session scoped) and upsert vector
+    const aiId = randomUUID();
+    const aiTags = ['ai_reply'];
+    await pool.query(
+      `INSERT INTO teachings (id, text, tags, scope, session_id) VALUES ($1,$2,$3,$4,$5)`,
+      [aiId, reply, aiTags, 'session', sessionId]
+    );
+    try {
+      const rv = await embedOne(reply);
+      await upsertPoint(aiId, rv, { id: aiId, text: reply, tags: aiTags, scope: 'session', session_id: sessionId });
+    } catch (e) {
+      console.warn('embed/upsert AI reply warn:', (e as Error).message);
+    }
+
+    return res.json({ reply, sources });
+  } catch (e) {
+    console.error('respond error', e);
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
+
+/** Reindex: rebuild all vectors from SQL */
+app.post('/reindex', async (_req, res) => {
+  try {
+    if (!openai) return res.status(400).json({ ok: false, error: 'no_openai' });
+    await ensureCollection();
+    const { rows } = await pool.query(`SELECT id, text, tags, scope, session_id FROM teachings ORDER BY created_at ASC`);
+    let ok = 0, fail = 0;
+    for (const r of rows) {
+      try {
+        const v = await embedOne(r.text);
+        await upsertPoint(r.id, v, { id: r.id, text: r.text, tags: r.tags ?? [], scope: r.scope, session_id: r.session_id });
+        ok++;
+      } catch { fail++; }
+    }
+    res.json({ ok: true, upserted: ok, failed: fail });
+  } catch (e) {
+    console.error('reindex error', e);
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
+// --- respond endpoint (local >=0.7; else OpenAI; save ai>=0.6 as global) ---
+app.post('/respond', async (req, res) => {
+  const { input, actor, sid } = req.body ?? {};
+  if (!input) return res.status(400).json({ error: 'missing input' });
+
+  try {
+    // 1) Local retrieval (replace with real vector search when ready)
+    const retrieved = await pool.query(
+      `SELECT * FROM teachings
+         WHERE scope IN ('global','session')
+         ORDER BY created_at DESC
+         LIMIT 20`
+    );
+
+    // TEMP scoring. Replace when Qdrant embedding similarity is wired.
+    const scored = retrieved.rows
+      .map(r => ({ ...r, score: Math.random() }))
+      .sort((a, b) => b.score - a.score);
+
+    const top = scored[0];
+    if (top && top.score >= 0.7) {
+      return res.json({
+        reply: top.text,
+        sources: scored.slice(0, 4),
+      });
+    }
+
+    // 2) Fallback to OpenAI
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: "You are MGM. Be concise and accurate." },
+        { role: "user", content: input }
+      ],
+    });
+
+    const aiText = completion.choices?.[0]?.message?.content?.trim() || 'Sorry, no answer.';
+    // TEMP "confidence". Replace with real similarity check if you embed the AI reply.
+    const aiScore = 0.65;
+
+    // Save AI reply to GLOBAL if it's "good enough"
+    if (aiScore >= 0.6) {
+      const id = randomUUID();
+      await pool.query(
+        `INSERT INTO teachings (id, text, tags, scope, session_id)
+         VALUES ($1,$2,$3,$4,$5)`,
+        [id, aiText, ['ai_reply'], 'global', sid || null]
+      );
+    }
+
+    return res.json({
+      reply: aiText,
+      sources: scored.slice(0, 4),
+    });
+  } catch (err) {
+    console.error('respond failed', err);
+    return res.status(500).json({ error: 'internal error' });
+  }
+});
+app.listen(PORT, () => {
+  console.log(`MGM listening on http://127.0.0.1:${PORT}`);
+});
+// --- respond endpoint ---
+
+  try {
+    // 1) check local retrieval
+    const retrieved = await pool.query(
+      `SELECT * FROM teachings WHERE scope IN ('global','session') ORDER BY created_at DESC LIMIT 20`
+    );
+    const scored = retrieved.rows.map(r => ({
+      ...r,
+      score: Math.random() // <-- replace with real similarity if hooked up to qdrant
+    })).sort((a, b) => b.score - a.score);
+
+    const top = scored[0];
+    if (top && top.score >= 0.7) {
+      return res.json({
+        reply: top.text,
+        sources: scored.slice(0, 4),
+      });
+    }
+
+    // 2) fallback to OpenAI
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: "You are MGM, answer briefly." },
+        { role: "user", content: input }
+      ],
+    });
+
+    const aiText = completion.choices[0].message.content;
+    const aiScore = 0.65; // stub score, replace w/ embedding similarity if needed
+
+    // If AI response is >=0.6, save it to GLOBAL
+    if (aiScore >= 0.6) {
+      const id = crypto.randomUUID();
+      await pool.query(
+        `INSERT INTO teachings (id, text, tags, scope, session_id)
+         VALUES ($1,$2,$3,$4,$5)`,
+        [id, aiText, ['ai_reply'], 'global', sid]
+      );
+    }
+
+    return res.json({
+      reply: aiText,
+      sources: scored.slice(0, 4),
+    });
+  } catch (err) {
+    console.error('respond failed', err);
+    res.status(500).json({ error: 'internal error' });
+  }
+});
+
+// --- respond endpoint (local >=0.7; else OpenAI; save ai>=0.6 as global) ---
+app.post('/respond', async (req, res) => {
+  const { input, actor, sid } = req.body ?? {};
+  if (!input) return res.status(400).json({ error: 'missing input' });
+
+  try {
+    // 1) Local retrieval — replace with real vector search when embeddings are wired
+    const r = await pool.query(
+      `SELECT * FROM teachings
+       WHERE scope IN ('global','session')
+       ORDER BY created_at DESC
+       LIMIT 20`
+    );
+
+    // TEMP: fake score; swap to cosine similarity when Qdrant hookup is done
+    const scored = r.rows
+      .map(row => ({ ...row, score: Math.random() }))
+      .sort((a, b) => b.score - a.score);
+
+    const top = scored[0];
+    if (top && top.score >= 0.7) {
+      return res.json({
+        reply: top.text,
+        sources: scored.slice(0, 4),
+      });
+    }
+
+    // 2) Fallback to OpenAI
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: "You are MGM. Be concise and accurate." },
+        { role: "user", content: input }
+      ],
+    });
+
+    const aiText =
+      completion.choices?.[0]?.message?.content?.trim() || 'Sorry, no answer.';
+    // TEMP: pretend confidence; compute real similarity later
+    const aiScore = 0.65;
+
+    // Save AI reply globally if it's good enough (>= 0.6)
+    if (aiScore >= 0.6) {
+      const id = randomUUID();
+      await pool.query(
+        `INSERT INTO teachings (id, text, tags, scope, session_id)
+         VALUES ($1,$2,$3,$4,$5)`,
+        [id, aiText, ['ai_reply'], 'global', sid || null]
+      );
+    }
+
+    return res.json({
+      reply: aiText,
+      sources: scored.slice(0, 4),
+    });
+  } catch (err) {
+    console.error('respond failed', err);
+    return res.status(500).json({ error: 'internal error' });
+  }
+});
