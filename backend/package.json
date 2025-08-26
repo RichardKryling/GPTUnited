@@ -1,0 +1,37 @@
+{
+  "name": "backend",
+  "version": "0.0.1",
+  "private": true,
+  "description": "GPTUnited NestJS backend (Sprint 1)",
+  "license": "MIT",
+  "main": "dist/main.js",
+  "types": "dist/main.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js",
+    "start:dev": "ts-node-dev --respawn --transpile-only src/main.ts",
+    "lint": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@nestjs/common": "^10.4.5",
+    "@nestjs/config": "^3.2.3",
+    "@nestjs/core": "^10.4.5",
+    "@nestjs/platform-express": "^10.4.5",
+    "@nestjs/platform-socket.io": "^10.4.5",
+    "@nestjs/throttler": "^5.2.0",
+    "@nestjs/websockets": "^10.4.5",
+    "axios": "^1.7.2",
+    "class-transformer": "^0.5.1",
+    "class-validator": "^0.14.0",
+    "reflect-metadata": "^0.1.13",
+    "rxjs": "^7.8.1",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "@types/uuid": "^9.0.7",
+    "ts-node": "^10.9.2",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.4.5"
+  }
+}
