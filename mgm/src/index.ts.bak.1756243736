@@ -1,0 +1,110 @@
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import { Pool } from 'pg';
+
+const PORT = Number(process.env.PORT ?? 8080);
+const DATABASE_URL = process.env.DATABASE_URL ?? 'postgresql://gptu:gptu@127.0.0.1:5432/gptu';
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '2mb' }));
+
+// ---- Postgres ----
+const pool = new Pool({ connectionString: DATABASE_URL });
+
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS teachings (
+      id TEXT PRIMARY KEY,
+      text TEXT NOT NULL,
+      tags TEXT[] DEFAULT '{}',
+      scope TEXT NOT NULL CHECK (scope IN ('global','session')),
+      session_id TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+  // quick secondary index for retrieval by recency + scope
+  await pool.query(`CREATE INDEX IF NOT EXISTS teachings_scope_created_idx ON teachings(scope, created_at DESC);`);
+}
+initDb().catch(err => { console.error('DB init failed', err); process.exit(1); });
+
+// util
+const uuid = () => crypto.randomUUID?.() ?? String(Date.now());
+
+// ---- routes ----
+app.get('/health', async (_req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ ok: true, db: 'up' });
+  } catch (e) {
+    res.status(500).json({ ok: false, db: 'down', error: String(e) });
+  }
+});
+
+// teach: persist
+app.post('/teach', async (req, res) => {
+  try {
+    const { text, tags = [], scope = 'session' } = req.body ?? {};
+    const sessionId = req.header('x-session-id') || null;
+
+    if (!text || typeof text !== 'string') return res.status(400).json({ ok: false, error: 'text required' });
+    if (!['global','session'].includes(scope)) return res.status(400).json({ ok: false, error: 'bad scope' });
+
+    const id = uuid();
+    await pool.query(
+      `INSERT INTO teachings (id, text, tags, scope, session_id) VALUES ($1,$2,$3,$4,$5)`,
+      [id, text, Array.isArray(tags) ? tags : [], scope, scope === 'session' ? sessionId : null]
+    );
+
+    res.json({ ok: true, id });
+  } catch (e) {
+    console.error('teach error', e);
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// respond: naive retrieval by recency (global + this session)
+app.post('/respond', async (req, res) => {
+  try {
+    const { input } = req.body ?? {};
+    const sessionId = req.header('x-session-id') || null;
+
+    // pull recent global + recent session teachings
+    const { rows } = await pool.query(
+      `
+      SELECT id, text, tags, scope, session_id, created_at
+      FROM teachings
+      WHERE scope = 'global'
+         OR (scope = 'session' AND session_id = $1)
+      ORDER BY created_at DESC
+      LIMIT 12
+      `,
+      [sessionId]
+    );
+
+    // super-dumb rank: “contains” match gets a little bump
+    const q = String(input ?? '').toLowerCase();
+    const scored = rows.map(r => ({
+      id: r.id,
+      text: r.text,
+      tags: r.tags,
+      score: q && r.text?.toLowerCase().includes(q) ? 0.60 : 0.40
+    })).sort((a,b) => b.score - a.score);
+
+    const reply = scored.length ? 'stub (retrieval ok)' : 'stub';
+    res.json({ reply, sources: scored.slice(0, 5) });
+  } catch (e) {
+    console.error('respond error', e);
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// reindex placeholder (for later when we add embeddings)
+app.post('/reindex', async (_req, res) => {
+  res.json({ ok: true, note: 'no-op for now; vectors coming next' });
+});
+
+app.listen(PORT, () => {
+  console.log(`MGM listening on http://127.0.0.1:${PORT}`);
+});
